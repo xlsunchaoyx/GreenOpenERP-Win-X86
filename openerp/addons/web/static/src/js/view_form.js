@@ -1958,7 +1958,7 @@ instance.web.form.WidgetButton = instance.web.form.FormWidget.extend({
         var exec_action = function() {
             if (self.node.attrs.confirm) {
                 var def = $.Deferred();
-                var dialog = instance.web.Dialog(this, {
+                var dialog = new instance.web.Dialog(this, {
                     title: _t('Confirm'),
                     buttons: [
                         {text: _t("Cancel"), click: function() {
@@ -2464,9 +2464,9 @@ instance.web.form.FieldCharDomain = instance.web.form.AbstractField.extend(insta
         var self = this;
         this.$el.html(instance.web.qweb.render("FieldCharDomain", {widget: this}));
         if (this.get('value')) {
+            var model = this.options.model || this.field_manager.get_field_value(this.options.model_field);
             var domain = instance.web.pyeval.eval('domain', this.get('value'));
-            var relation = this.getParent().fields.mailing_model.get('value')[0];
-            var ds = new instance.web.DataSetStatic(self, relation, self.build_context());
+            var ds = new instance.web.DataSetStatic(self, model, self.build_context());
             ds.call('search_count', [domain]).then(function (results) {
                 $('.oe_domain_count', self.$el).text(results + ' records selected');
                 $('button span', self.$el).text(' Change selection');
@@ -3451,20 +3451,25 @@ instance.web.form.FieldMany2One = instance.web.form.AbstractField.extend(instanc
                 return;
             }
             var pop = new instance.web.form.FormOpenPopup(self);
-            pop.show_element(
-                self.field.relation,
-                self.get("value"),
-                self.build_context(),
-                {
-                    title: _t("Open: ") + self.string
-                }
-            );
-            pop.on('write_completed', self, function(){
-                self.display_value = {};
-                self.display_value_backup = {};
-                self.render_value();
-                self.focus();
-                self.view.do_onchange(self);
+            var context = self.build_context().eval();
+            var model_obj = new instance.web.Model(self.field.relation);
+            model_obj.call('get_formview_id', [self.get("value"), context]).then(function(view_id){
+                pop.show_element(
+                    self.field.relation,
+                    self.get("value"),
+                    self.build_context(),
+                    {
+                        title: _t("Open: ") + self.string,
+                        view_id: view_id
+                    }
+                );
+                pop.on('write_completed', self, function(){
+                    self.display_value = {};
+                    self.display_value_backup = {};
+                    self.render_value();
+                    self.focus();
+                    self.view.do_onchange(self);
+                });
             });
         });
 
@@ -3660,13 +3665,10 @@ instance.web.form.FieldMany2One = instance.web.form.AbstractField.extend(instanc
                  .html(link);
             if (! this.options.no_open)
                 $link.click(function () {
-                    self.do_action({
-                        type: 'ir.actions.act_window',
-                        res_model: self.field.relation,
-                        res_id: self.get("value"),
-                        views: [[false, 'form']],
-                        target: 'current',
-                        context: self.build_context().eval(),
+                    var context = self.build_context().eval();
+                    var model_obj = new instance.web.Model(self.field.relation);
+                    model_obj.call('get_formview_action', [self.get("value"), context]).then(function(action){
+                        self.do_action(action);
                     });
                     return false;
                  });
