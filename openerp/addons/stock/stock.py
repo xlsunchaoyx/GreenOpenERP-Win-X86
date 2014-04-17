@@ -283,7 +283,7 @@ class stock_quant(osv.osv):
 
     def read_group(self, cr, uid, domain, fields, groupby, offset=0, limit=None, context=None, orderby=False, lazy=True):
         ''' Overwrite the read_group in order to sum the function field 'inventory_value' in group by'''
-        res = super(stock_quant, self).read_group(cr, uid, domain, fields, groupby, offset=offset, limit=limit, context=context, orderby=orderby, lazy=True)
+        res = super(stock_quant, self).read_group(cr, uid, domain, fields, groupby, offset=offset, limit=limit, context=context, orderby=orderby, lazy=lazy)
         if 'inventory_value' in fields:
             for line in res:
                 if '__domain' in line:
@@ -555,8 +555,6 @@ class stock_quant(osv.osv):
             if move.partially_available:
                 self.pool.get("stock.move").write(cr, uid, [move.id], {'partially_available': False}, context=context)
             self.write(cr, SUPERUSER_ID, related_quants, {'reservation_id': False}, context=context)
-            for quant in move.reserved_quant_ids:
-                self._quant_reconcile_negative(cr, uid, quant, move, context=context)
 
     def _quants_get_order(self, cr, uid, location, product, quantity, domain=[], orderby='in_date', context=None):
         ''' Implementation of removal strategies
@@ -646,7 +644,7 @@ class stock_picking(osv.osv):
         '''The state of a picking depends on the state of its related stock.move
             draft: the picking has no line or any one of the lines is draft
             done, draft, cancel: all lines are done / draft / cancel
-            confirmed, auto, assigned depends on move_type (all at once or direct)
+            confirmed, waiting, assigned, partially_available depends on move_type (all at once or partial)
         '''
         res = {}
         for pick in self.browse(cr, uid, ids, context=context):
@@ -671,11 +669,14 @@ class stock_picking(osv.osv):
                 #in partially available state, otherwise, picking is in waiting or confirmed state
                 res[pick.id] = order_inv[max(lst)]
                 if not all(x == 2 for x in lst):
-                    #if all moves aren't assigned, check if we have one product partially available
-                    for move in pick.move_lines:
-                        if move.partially_available:
-                            res[pick.id] = 'partially_available'
-                            break
+                    if any(x == 2 for x in lst):
+                        res[pick.id] = 'partially_available'
+                    else:
+                        #if all moves aren't assigned, check if we have one product partially available
+                        for move in pick.move_lines:
+                            if move.partially_available:
+                                res[pick.id] = 'partially_available'
+                                break
         return res
 
     def _get_pickings(self, cr, uid, ids, context=None):
@@ -2134,7 +2135,7 @@ class stock_move(osv.osv):
         pack_obj = self.pool.get("stock.quant.package")
         packs = set()
         for move in self.browse(cr, uid, ids, context=context):
-            packs |= set([q.package_id.id for q in move.quant_ids if q.package_id and q.qty > 0])
+            packs |= set([q.package_id for q in move.quant_ids if q.package_id and q.qty > 0])
         return pack_obj._check_location_constraint(cr, uid, list(packs), context=context)
 
     def find_move_ancestors(self, cr, uid, move, context=None):
@@ -2195,7 +2196,6 @@ class stock_move(osv.osv):
                 dom = main_domain + self.pool.get('stock.move.operation.link').get_specific_domain(cr, uid, record, context=context)
                 quants = quant_obj.quants_get_prefered_domain(cr, uid, ops.location_id, move.product_id, record.qty, domain=dom, prefered_domain=prefered_domain,
                                                           fallback_domain=fallback_domain, restrict_lot_id=move.restrict_lot_id.id, restrict_partner_id=move.restrict_partner_id.id, context=context)
-                self.check_quants_history(cr, uid, move, quants, context=context)
                 if ops.result_package_id.id:
                     #if a result package is given, all quants go there
                     quant_dest_package_id = ops.result_package_id.id
@@ -2219,7 +2219,6 @@ class stock_move(osv.osv):
                 self.check_tracking(cr, uid, move, move.restrict_lot_id.id, context=context)
                 qty = move_qty[move.id]
                 quants = quant_obj.quants_get_prefered_domain(cr, uid, move.location_id, move.product_id, qty, domain=main_domain, prefered_domain=prefered_domain, fallback_domain=fallback_domain, restrict_lot_id=move.restrict_lot_id.id, restrict_partner_id=move.restrict_partner_id.id, context=context)
-                self.check_quants_history(cr, uid, move, quants, context=context)
                 quant_obj.quants_move(cr, uid, quants, move, move.location_dest_id, lot_id=move.restrict_lot_id.id, owner_id=move.restrict_partner_id.id, context=context)
             #unreserve the quants and make them available for other operations/moves
             quant_obj.quants_unreserve(cr, uid, move, context=context)
@@ -3375,7 +3374,7 @@ class stock_location_path(osv.osv):
     }
     _defaults = {
         'auto': 'auto',
-        'delay': 1,
+        'delay': 0,
         'invoice_state': 'none',
         'company_id': lambda self, cr, uid, c: self.pool.get('res.company')._company_default_get(cr, uid, 'procurement.order', context=c),
         'propagate': True,
@@ -3513,20 +3512,25 @@ class stock_package(osv.osv):
         'name': lambda self, cr, uid, context: self.pool.get('ir.sequence').get(cr, uid, 'stock.quant.package') or _('Unknown Pack')
     }
 
-    def _check_location_constraint(self, cr, uid, ids, context=None):
+    def _check_location_constraint(self, cr, uid, packs, context=None):
         '''checks that all quants in a package are stored in the same location. This function cannot be used
            as a constraint because it needs to be checked on pack operations (they may not call write on the
            package)
         '''
         quant_obj = self.pool.get('stock.quant')
-        for pack in self.browse(cr, uid, ids, context=context):
+        for pack in packs:
             parent = pack
             while parent.parent_id:
                 parent = parent.parent_id
             quant_ids = self.get_content(cr, uid, [parent.id], context=context)
             quants = quant_obj.browse(cr, uid, quant_ids, context=context)
-            location_id = quants and quants[0].location_id.id or False
-            if not all([quant.location_id.id == location_id for quant in quants if quant.qty > 0]):
+            normal_quants = [x for x in quants if not x.propagated_from_id if x.qty > 0]
+            propagated_quants = [x for x in quants if x.propagated_from_id if x.qty > 0]
+            location_id = normal_quants and normal_quants[0].location_id.id or False
+            prop_loc_id = propagated_quants and propagated_quants[0].location_id.id or False
+            all_normal = all([quant.location_id.id == location_id for quant in normal_quants])
+            all_propagated = all([quant.location_id.id == prop_loc_id for quant in propagated_quants])
+            if not all_normal or not all_propagated:
                 raise osv.except_osv(_('Error'), _('Everything inside a package should be in the same location'))
         return True
 
